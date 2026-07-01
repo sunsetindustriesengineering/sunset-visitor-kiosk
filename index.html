@@ -1,486 +1,965 @@
-/* ============================================================================
-   Sunset Industries - Scheduling Board host server
-   ----------------------------------------------------------------------------
-     /api/query                  - runs a single read-only SELECT, returns rows
-     /api/part-files?part=XXX    - a part's drawings (main + OP sheets), labeled
-     /file?part=XXX&i=N          - streams the N-th drawing PDF (native viewing)
-     /  and /vendor/*            - the board page and optional bundled pdf.js
-
-   Read-only by design: the SQL login is db_datareader, /api/query refuses
-   anything that isn't a single SELECT, and the file routes only READ from the
-   configured print roots (with a path-traversal guard). Nothing is ever
-   written, moved, or deleted on the share or in the database.
-   ========================================================================== */
-
-const http = require('http');
-const fs   = require('fs');
-const path = require('path');
-const url  = require('url');
-const sql  = require('mssql');
-const zlib = require('zlib');
-const crypto = require('crypto');
-
-const DIR = __dirname;
-const CFG = JSON.parse(fs.readFileSync(path.join(DIR, 'config.json'), 'utf8'));
-
-const PORT = CFG.port || 8080;
-const HOST = CFG.host || '0.0.0.0';
-const ALLOWED_ROOTS = (CFG.allowedRoots || ['S:\\Customers']).map(r => r.toLowerCase());
-
-process.on('unhandledRejection', e => console.error('unhandledRejection:', (e && e.message) || e));
-process.on('uncaughtException',  e => console.error('uncaughtException:',  (e && e.message) || e));
-
-const sqlConfig = {
-  user:     CFG.sql.user,
-  password: CFG.sql.password,
-  server:   CFG.sql.server,
-  database: CFG.sql.database,
-  port:     CFG.sql.port || 1433,
-  options:  { encrypt: !!CFG.sql.encrypt, trustServerCertificate: true },
-  pool:     { max: 6, min: 0, idleTimeoutMillis: 30000 }
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#EB6E19">
+<title>Sunset Industries — Visitor Sign-In</title>
+<style>
+:root {
+  color-scheme: light;
+  --orange: #EB6E19;
+  --orange-soft: #FFF3E0;
+  --orange-border: #EF8B47;
+  --dark: #1A1A1A;
+  --text: #2A2A2A;
+  --muted: #6B6B67;
+  --gray: #F5F4F1;
+  --border: #DDDBD4;
+  --white: #FFFFFF;
+  --success: #2E7D4F;
+  --success-soft: #E5F2EB;
+  --info: #3B6CB0;
+  --info-soft: #E6EEF7;
+  --info-border: #98B5D6;
+  --warn: #B85A1F;
+  --warn-soft: #FFE9D6;
+  --danger: #B33B2E;
+  --danger-soft: #F9E4E1;
+}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap');
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  font-family: 'IBM Plex Sans', -apple-system, sans-serif;
+  background: var(--gray);
+  color: var(--text);
+  font-size: 16px;
+  min-height: 100vh;
+  -webkit-tap-highlight-color: transparent;
+}
+button, input, select, textarea {
+  font-family: inherit; font-size: inherit; color: inherit;
+}
+/* ===== App shell ===== */
+.app {
+  max-width: 980px;
+  margin: 0 auto;
+  min-height: 100vh;
+  background: var(--white);
+  display: flex; flex-direction: column;
+  box-shadow: 0 0 24px rgba(0,0,0,0.06);
+}
+header.kiosk-header {
+  background: var(--dark);
+  color: var(--white);
+  padding: 18px 32px;
+  display: flex; align-items: center; gap: 20px;
+  border-bottom: 4px solid var(--orange);
+}
+.logo {
+  display: flex; align-items: center; gap: 16px;
+}
+.logo img {
+  height: 56px; width: auto;
+}
+.title-stack {
+  display: flex; flex-direction: column;
+}
+.title-stack .t {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--orange);
+}
+.title-stack .s {
+  font-size: 12px; color: rgba(255,255,255,0.65);
+  margin-top: 2px;
+}
+.now-time {
+  margin-left: auto; text-align: right; font-variant-numeric: tabular-nums;
+}
+.now-time .clock { font-size: 28px; font-weight: 600; line-height: 1; }
+.now-time .date  { font-size: 12px; color: rgba(255,255,255,0.65); margin-top: 4px; }
+/* ===== Screens ===== */
+main.screen-area {
+  flex: 1; padding: 40px 48px;
+  display: flex; flex-direction: column;
+}
+.screen { display: none; flex: 1; flex-direction: column; }
+.screen.active { display: flex; }
+h1 { font-size: 32px; font-weight: 600; margin: 0 0 10px; color: var(--dark); }
+h2 { font-size: 22px; font-weight: 600; margin: 0 0 12px; color: var(--dark); }
+.intro { font-size: 17px; color: var(--muted); margin-bottom: 32px; }
+/* ===== Tile selector (access type) ===== */
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 32px; }
+.tile {
+  background: var(--white); border: 2px solid var(--border);
+  border-radius: 14px; padding: 28px 24px; cursor: pointer;
+  transition: all 0.2s; text-align: left; font: inherit; color: inherit;
+}
+.tile:hover { border-color: var(--orange); }
+.tile.selected {
+  border-color: var(--orange); background: var(--orange-soft);
+}
+.tile .tag {
+  font-family: monospace; font-size: 11px; font-weight: 700;
+  color: var(--orange); letter-spacing: 0.1em; text-transform: uppercase;
+}
+.tile .tile-title { font-size: 22px; font-weight: 600; color: var(--dark); margin-top: 8px; }
+.tile .tile-desc  { font-size: 14px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+.tile.recommended::after {
+  content: 'Default'; float: right;
+  background: var(--orange); color: white; font-size: 10px;
+  padding: 3px 8px; border-radius: 10px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+/* ===== Form sections ===== */
+.section {
+  background: var(--white); border: 1px solid var(--border); border-radius: 12px;
+  margin-bottom: 18px; overflow: hidden;
+}
+.section-head {
+  padding: 12px 20px; font-weight: 600; font-size: 14px;
+  letter-spacing: 0.04em; text-transform: uppercase; display: flex; align-items: center; gap: 10px;
+}
+.section-head .who { font-size: 11px; font-weight: 500; padding: 3px 9px; border-radius: 10px; letter-spacing: 0.05em; }
+.section.visitor .section-head { background: var(--info-soft); color: var(--info); border-bottom: 2px solid var(--info-border); }
+.section.visitor .who { background: var(--info); color: white; }
+.section.escort .section-head { background: var(--orange-soft); color: var(--orange); border-bottom: 2px solid var(--orange-border); }
+.section.escort .who { background: var(--orange); color: white; }
+.section.mgmt .section-head { background: #2A2A2A; color: var(--white); border-bottom: 2px solid var(--orange); }
+.section.mgmt .who { background: var(--orange); color: white; }
+.section.briefing .section-head { background: var(--orange-soft); color: var(--orange); border-bottom: 2px solid var(--orange-border); }
+.section.briefing .who { background: var(--orange); color: white; }
+.section-body { padding: 20px; }
+/* ===== Form controls ===== */
+.field { margin-bottom: 18px; }
+.field label, .field-label {
+  display: block; font-size: 13px; font-weight: 600;
+  color: var(--dark); margin-bottom: 8px;
+}
+.field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.field-hint.warn { color: var(--warn); font-weight: 500; }
+input[type=text], input[type=date], input[type=time], textarea {
+  width: 100%; padding: 14px 16px; font-size: 16px;
+  border: 1.5px solid var(--border); border-radius: 8px;
+  background: var(--white); color: var(--text); transition: border-color 0.15s;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--orange); }
+input[readonly] { background: var(--gray); color: var(--muted); cursor: default; }
+textarea { min-height: 70px; resize: vertical; }
+/* ===== Chip selectors ===== */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.chip {
+  padding: 10px 18px; background: var(--white);
+  border: 1.5px solid var(--border); border-radius: 24px;
+  font-size: 14px; cursor: pointer; transition: all 0.15s;
+  font-weight: 500; color: var(--dark);
+}
+.chip:hover { border-color: var(--orange); }
+.chip.active { background: var(--orange); border-color: var(--orange); color: white; }
+.chip.custom-trigger { border-style: dashed; font-style: italic; color: var(--muted); }
+.chip-custom-input { width: 100%; margin-top: 8px; display: none; }
+.chip-custom-input.show { display: block; }
+/* ===== Checkbox cluster (Areas Authorized) ===== */
+.checks { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.check {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border: 1.5px solid var(--border); border-radius: 8px;
+  cursor: pointer; transition: all 0.15s; user-select: none;
+}
+.check:hover { border-color: var(--orange); }
+.check input { width: 20px; height: 20px; accent-color: var(--orange); margin: 0; }
+.check.checked { border-color: var(--orange); background: var(--orange-soft); }
+/* ===== Acknowledgment box ===== */
+.ack {
+  background: var(--gray); border: 1.5px solid var(--border); border-radius: 10px;
+  padding: 16px 18px; margin-bottom: 18px;
+}
+.ack-text { font-size: 14px; color: var(--text); line-height: 1.55; margin-bottom: 12px; }
+.ack-check {
+  display: flex; align-items: center; gap: 12px; cursor: pointer; user-select: none;
+  font-size: 14px; font-weight: 600; color: var(--dark);
+}
+.ack-check input { width: 22px; height: 22px; accent-color: var(--orange); margin: 0; }
+/* ===== Signature attestation ===== */
+.sig-block {
+  background: var(--gray); border: 1.5px solid var(--border);
+  border-radius: 10px; padding: 16px 18px; margin-bottom: 18px;
+}
+.sig-block .legal {
+  font-size: 12px; color: var(--muted); margin-bottom: 12px; line-height: 1.5; font-style: italic;
+}
+.sig-input {
+  font-family: 'Brush Script MT', 'Lucida Handwriting', cursive;
+  font-size: 24px !important; font-weight: 400;
+  padding: 16px 18px !important; background: var(--white) !important; color: var(--dark) !important;
+}
+/* ===== Buttons ===== */
+.btn-row { display: flex; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
+.btn {
+  padding: 16px 32px; font-size: 16px; font-weight: 600;
+  border-radius: 10px; cursor: pointer; transition: all 0.15s;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 56px; border: none;
+}
+.btn.primary { background: var(--orange); color: white; }
+.btn.primary:hover { background: #D55F0E; }
+.btn.primary:disabled { background: var(--border); cursor: not-allowed; }
+.btn.ghost { background: var(--white); border: 1.5px solid var(--border); color: var(--dark); }
+.btn.ghost:hover { border-color: var(--orange); color: var(--orange); }
+.btn.large { padding: 22px 44px; font-size: 18px; min-height: 72px; }
+.btn-row.right { justify-content: flex-end; }
+/* ===== Notes / banners ===== */
+.banner {
+  padding: 14px 18px; border-radius: 10px; margin-bottom: 18px;
+  display: flex; align-items: flex-start; gap: 12px;
+  font-size: 14px; line-height: 1.5;
+}
+.banner.info { background: var(--info-soft); border-left: 4px solid var(--info); color: var(--dark); }
+.banner.warn { background: var(--warn-soft); border-left: 4px solid var(--warn); color: var(--dark); }
+.banner.success { background: var(--success-soft); border-left: 4px solid var(--success); color: var(--dark); }
+/* ===== Two-column row ===== */
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+/* ===== Success screen ===== */
+.success-screen { align-items: center; justify-content: center; text-align: center; flex: 1; }
+.checkmark {
+  width: 120px; height: 120px; border-radius: 50%;
+  background: var(--success-soft); color: var(--success);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 80px; line-height: 1; margin: 0 auto 24px;
+}
+.success-screen h1 { font-size: 42px; margin-bottom: 8px; }
+.success-screen .sub { font-size: 18px; color: var(--muted); margin-bottom: 32px; }
+.countdown {
+  font-size: 60px; font-weight: 600; color: var(--orange);
+  font-variant-numeric: tabular-nums; line-height: 1;
+}
+.countdown-label { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 8px; }
+/* ===== Footer ===== */
+footer.kiosk-foot {
+  background: var(--dark); color: rgba(255,255,255,0.55);
+  padding: 12px 32px; font-size: 11px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+footer .status-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--success); margin-right: 6px;
+}
+footer .status-dot.offline { background: var(--warn); }
+footer .status-dot.queued { background: var(--info); }
+/* ===== Briefing modal ===== */
+.modal-bg {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.55); z-index: 100;
+  display: none; align-items: center; justify-content: center;
+}
+.modal-bg.show { display: flex; }
+.modal {
+  background: var(--white); border-radius: 14px;
+  width: 90%; max-width: 760px; max-height: 90vh;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.modal-head {
+  padding: 18px 24px; background: var(--dark); color: var(--white);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.modal-head h3 { margin: 0; font-size: 18px; }
+.modal-body { padding: 24px; overflow-y: auto; font-size: 14px; line-height: 1.65; }
+.modal-body h4 { margin-top: 18px; margin-bottom: 8px; color: var(--orange); }
+.modal-body ul { padding-left: 20px; }
+.modal-foot { padding: 16px 24px; border-top: 1px solid var(--border); text-align: right; }
+.x-close { background: none; border: none; color: white; font-size: 24px; cursor: pointer; padding: 0; line-height: 1; }
+/* ===== Helpers ===== */
+.estimated-flag {
+  display: inline-block; background: var(--warn-soft); color: var(--warn);
+  font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 600;
+  letter-spacing: 0.05em; margin-left: 8px;
+}
+.required { color: var(--orange); }
+.hide { display: none !important; }
+@media (max-width: 700px) {
+  main.screen-area { padding: 24px 18px; }
+  .tiles { grid-template-columns: 1fr; }
+  .checks { grid-template-columns: 1fr; }
+  .row2 { grid-template-columns: 1fr; }
+  .now-time { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ============== HEADER ============== -->
+  <header class="kiosk-header">
+    <div class="logo">
+      <img src="PASTE_ORIGINAL_LOGO_DATA_URI_HERE" alt="Sunset Industries">
+      <!-- NOTE: the original file's embedded base64 logo goes in the src above. -->
+    </div>
+    <div class="title-stack">
+      <span class="t">Visitor Sign-In</span>
+      <span class="s">7567 Tyler Blvd · Mentor, OH 44060</span>
+    </div>
+    <div class="now-time">
+      <div class="clock" id="liveClock">—</div>
+      <div class="date" id="liveDate">—</div>
+    </div>
+  </header>
+  <main class="screen-area">
+    <!-- ============== SCREEN 1: WELCOME / ACCESS TYPE ============== -->
+    <section class="screen active" id="screen-welcome">
+      <h1>Welcome to Sunset Industries</h1>
+      <p class="intro">Please choose how you're visiting today. A Sunset team member will help if you're not sure.</p>
+      <div class="tiles">
+        <button type="button" class="tile recommended selected" data-type="Escorted" id="tile-escorted">
+          <div class="tag">Most Common</div>
+          <div class="tile-title">Escorted Visit</div>
+          <div class="tile-desc">You'll be accompanied by a Sunset employee for the duration of your visit. Quick sign-in: visitor + escort sign together.</div>
+        </button>
+        <button type="button" class="tile" data-type="Unescorted" id="tile-unescorted">
+          <div class="tag">Requires Approval</div>
+          <div class="tile-title">Unescorted Visit</div>
+          <div class="tile-desc">Pre-approved for unescorted access. Requires an ITAR briefing, U.S. person verification, and a Sunset manager's authorization.</div>
+        </button>
+      </div>
+      <div class="btn-row right">
+        <button type="button" class="btn primary large" id="btn-start">Continue →</button>
+      </div>
+    </section>
+    <!-- ============== SCREEN 2: ESCORTED FORM ============== -->
+    <section class="screen" id="screen-escorted">
+      <h1>Escorted Visit — Sign-In</h1>
+      <p class="intro">Quick form. Your escort will fill out their portion at the bottom.</p>
+      <!-- VISITOR SECTION -->
+      <div class="section visitor">
+        <div class="section-head">Visitor Information <span class="who">VISITOR FILLS THIS OUT</span></div>
+        <div class="section-body">
+          <div class="field">
+            <label>Your Full Name <span class="required">*</span></label>
+            <input type="text" id="esc-name" autocomplete="off" autocapitalize="words" placeholder="First and last name">
+          </div>
+          <div class="field">
+            <label>Company / Organization <span class="required">*</span></label>
+            <div class="chips" id="esc-company-chips"></div>
+            <input type="text" id="esc-company" autocomplete="off" autocapitalize="words" placeholder="Type your company name">
+          </div>
+          <div class="field">
+            <label>Purpose of Visit <span class="required">*</span></label>
+            <div class="chips" id="esc-purpose-chips"></div>
+            <input type="text" id="esc-purpose" autocomplete="off" placeholder="Briefly describe the reason for your visit">
+          </div>
+          <div class="row2">
+            <div class="field">
+              <label>Date of Visit</label>
+              <input type="date" id="esc-date" readonly>
+              <div class="field-hint">Auto-filled to today.</div>
+            </div>
+            <div class="field">
+              <label>Time In</label>
+              <input type="time" id="esc-time-in" readonly>
+              <div class="field-hint">Auto-filled to now.</div>
+            </div>
+          </div>
+          <div class="field">
+            <label>Estimated Time Out <span class="estimated-flag">ESTIMATED</span></label>
+            <input type="time" id="esc-time-out">
+            <div class="field-hint warn">Best guess. If your visit runs longer, that's fine.</div>
+          </div>
+          <div class="ack">
+            <div class="ack-text">
+              I understand that <strong>photography, audio/video recording, screen capture, and any access to technical data</strong> are prohibited while at Sunset Industries. I will remain with my escort at all times and will not enter areas beyond what my escort directs.
+            </div>
+            <label class="ack-check">
+              <input type="checkbox" id="esc-ack"> I acknowledge and agree.
+            </label>
+          </div>
+          <div class="sig-block">
+            <div class="field-label">Your Signature (typed name) <span class="required">*</span></div>
+            <div class="legal">By typing my full name below I am providing an electronic signature with the same legal effect as a handwritten one, and I attest that all information above is accurate.</div>
+            <input type="text" class="sig-input" id="esc-sig" autocomplete="off" autocapitalize="words" placeholder="Type your name to sign">
+          </div>
+        </div>
+      </div>
+      <!-- ESCORT SECTION -->
+      <div class="section escort">
+        <div class="section-head">Escort Sign-Off <span class="who">SUNSET ESCORT — FILL THIS OUT</span></div>
+        <div class="section-body">
+          <div class="banner warn">
+            <div><strong>Hi Sunset team member:</strong> If you are the employee escorting this visitor, please type your name below to confirm you'll stay with them throughout the visit.</div>
+          </div>
+          <div class="sig-block">
+            <div class="field-label">Escort Name (typed) <span class="required">*</span></div>
+            <input type="text" class="sig-input" id="esc-escort-sig" autocomplete="off" autocapitalize="words" placeholder="Type Sunset escort name">
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn ghost" id="esc-back">← Back</button>
+        <button type="button" class="btn primary large" id="esc-submit" style="margin-left:auto">Submit Sign-In</button>
+      </div>
+    </section>
+    <!-- ============== SCREEN 3: UNESCORTED FORM ============== -->
+    <section class="screen" id="screen-unescorted">
+      <h1>Unescorted Visit — Sign-In</h1>
+      <p class="intro">Three parts: ITAR briefing acknowledgment, your information, and a Sunset manager's authorization.</p>
+      <!-- BRIEFING -->
+      <div class="section briefing">
+        <div class="section-head">1. ITAR Briefing <span class="who">VISITOR — REQUIRED</span></div>
+        <div class="section-body">
+          <div class="banner info">
+            <div>Please read the ITAR Visitor Briefing before continuing. The briefing covers what you may and may not do on the floor — including handling of technical data, what counts as a "deemed export," and visible markings to watch for.</div>
+          </div>
+          <div class="btn-row" style="margin-top: 0;">
+            <button type="button" class="btn ghost" id="open-briefing">Open ITAR Briefing →</button>
+          </div>
+          <div class="ack" style="margin-top: 18px;">
+            <label class="ack-check">
+              <input type="checkbox" id="uns-briefing-ack"> I have read and understood the ITAR Briefing.
+            </label>
+          </div>
+        </div>
+      </div>
+      <!-- VISITOR INFO -->
+      <div class="section visitor">
+        <div class="section-head">2. Visitor Information <span class="who">VISITOR FILLS THIS OUT</span></div>
+        <div class="section-body">
+          <div class="field">
+            <label>Your Full Name <span class="required">*</span></label>
+            <input type="text" id="uns-name" autocomplete="off" autocapitalize="words" placeholder="First and last name">
+          </div>
+          <div class="field">
+            <label>Company / Organization <span class="required">*</span></label>
+            <div class="chips" id="uns-company-chips"></div>
+            <input type="text" id="uns-company" autocomplete="off" autocapitalize="words" placeholder="Type your company name">
+          </div>
+          <div class="ack">
+            <div class="ack-text">
+              <strong>U.S. Person Self-Declaration.</strong>
+              I attest that I am a U.S. person as defined by ITAR (22 CFR § 120.62): a U.S. citizen, lawful permanent resident, refugee, or asylee. If this becomes inaccurate I will notify Sunset immediately.
+            </div>
+            <label class="ack-check">
+              <input type="checkbox" id="uns-uspers"> I am a U.S. person and I attest to the above.
+            </label>
+          </div>
+          <div class="sig-block">
+            <div class="field-label">Your Signature (typed name) <span class="required">*</span></div>
+            <div class="legal">Typing my name below provides an electronic signature with the same legal effect as a handwritten one, and I attest that all information above is accurate.</div>
+            <input type="text" class="sig-input" id="uns-sig" autocomplete="off" autocapitalize="words" placeholder="Type your name to sign">
+          </div>
+        </div>
+      </div>
+      <!-- MGMT SECTION -->
+      <div class="section mgmt">
+        <div class="section-head" style="color: white;">3. Management Authorization <span class="who">SUNSET MANAGER — FILL THIS OUT</span></div>
+        <div class="section-body">
+          <div class="banner warn">
+            <div><strong>Sunset manager:</strong> Please visually verify the visitor's government-issued photo ID and proof of U.S. person status (passport, LPR card, etc.). Sunset does NOT copy or retain these documents.</div>
+          </div>
+          <div class="ack">
+            <label class="ack-check">
+              <input type="checkbox" id="uns-mgmt-id"> I have visually verified the visitor's photo ID and proof of U.S. person status.
+            </label>
+          </div>
+          <div class="field">
+            <label>Purpose of Visit / Business Need <span class="required">*</span></label>
+            <div class="chips" id="uns-purpose-chips"></div>
+            <input type="text" id="uns-purpose" autocomplete="off" placeholder="What is the visitor here to do?">
+          </div>
+          <div class="field">
+            <label>Areas Authorized for Access <span class="required">*</span></label>
+            <div class="checks" id="uns-areas"></div>
+          </div>
+          <div class="row2">
+            <div class="field">
+              <label>Authorization Start Date</label>
+              <input type="date" id="uns-start-date">
+            </div>
+            <div class="field">
+              <label>Authorization Start Time</label>
+              <input type="time" id="uns-start-time">
+            </div>
+          </div>
+          <div class="row2">
+            <div class="field">
+              <label>Authorization End Date</label>
+              <input type="date" id="uns-end-date">
+            </div>
+            <div class="field">
+              <label>Authorization End Time</label>
+              <input type="time" id="uns-end-time">
+            </div>
+          </div>
+          <div class="field">
+            <label>Manager Name <span class="required">*</span></label>
+            <input type="text" id="uns-mgmt-name" autocomplete="off" autocapitalize="words" placeholder="Sunset manager full name">
+          </div>
+          <div class="sig-block">
+            <div class="field-label">Manager Signature (typed name) <span class="required">*</span></div>
+            <div class="legal">By typing my name below I am providing an electronic signature confirming the above authorization on behalf of Sunset Industries, Inc.</div>
+            <input type="text" class="sig-input" id="uns-mgmt-sig" autocomplete="off" autocapitalize="words" placeholder="Type manager name to sign">
+          </div>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn ghost" id="uns-back">← Back</button>
+        <button type="button" class="btn primary large" id="uns-submit" style="margin-left:auto">Submit Sign-In & Authorize</button>
+      </div>
+    </section>
+    <!-- ============== SCREEN 4: SUCCESS ============== -->
+    <section class="screen success-screen" id="screen-success">
+      <div class="checkmark">✓</div>
+      <h1 id="success-greeting">Welcome to Sunset, friend!</h1>
+      <p class="sub" id="success-sub">Your sign-in has been recorded. A copy was sent to management.</p>
+      <div class="countdown" id="countdown">10</div>
+      <div class="countdown-label">Returning to start in</div>
+      <div class="btn-row" style="margin-top: 28px;">
+        <button type="button" class="btn ghost large" id="reset-now">Sign in another visitor now →</button>
+      </div>
+    </section>
+  </main>
+  <!-- ============== FOOTER ============== -->
+  <footer class="kiosk-foot">
+    <span>Sunset Industries, Inc. · Confidential · Form ID SI-ITAR-VIS-1.0</span>
+    <span><span class="status-dot" id="status-dot"></span><span id="status-text">Online</span><span id="queued-count"></span></span>
+  </footer>
+</div>
+<!-- ============== BRIEFING MODAL ============== -->
+<div class="modal-bg" id="briefing-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>ITAR Visitor Briefing — Sunset Industries</h3>
+      <button type="button" class="x-close" id="close-briefing">×</button>
+    </div>
+    <div class="modal-body" id="briefing-content">
+      <p><strong>Welcome.</strong> Sunset Industries manufactures components for U.S. defense customers. Some of the work in this facility is governed by the International Traffic in Arms Regulations (ITAR), 22 CFR Parts 120–130. This briefing covers what that means for your visit.</p>
+      <h4>What ITAR Means For You</h4>
+      <ul>
+        <li><strong>Defense-related drawings and parts are protected.</strong> If you see something marked ITAR, military, or with an export-control notice, that's controlled information.</li>
+        <li><strong>"Deemed export" rules apply on-site.</strong> Showing a drawing, screen, or part to a person who is not a U.S. person is treated as an export under U.S. federal law.</li>
+        <li>You are here because Sunset has confirmed you qualify as a U.S. person under § 120.62.</li>
+      </ul>
+      <h4>While You're Here, You Must NOT</h4>
+      <ul>
+        <li>Take photos, videos, audio recordings, or screen captures of any work, drawings, parts, or screens.</li>
+        <li>Use a USB drive, external hard drive, or any removable media on Sunset's systems.</li>
+        <li>Discuss specific Sunset work, drawings, programs, or customers with anyone outside Sunset.</li>
+        <li>Enter areas you weren't authorized for. If you're not sure where you can go, ask your point of contact.</li>
+        <li>Email yourself or anyone else any document, drawing, photo, or technical information from Sunset.</li>
+      </ul>
+      <h4>What You SHOULD Do</h4>
+      <ul>
+        <li>Place your phone in the designated phone storage area near the lockers/bathrooms while on the floor.</li>
+        <li>If you need to take notes for your own work, keep them general — no part numbers, specifications, or program names.</li>
+        <li>If you see something that looks like a compliance issue, tell Alex Hauptman, Peter Hauptman, or Karen Hauptman.</li>
+      </ul>
+      <h4>Consequences of Violation</h4>
+      <p>Unauthorized release of ITAR-controlled technical data carries civil penalties up to $1.27M per violation and potential criminal penalties under 22 CFR §§ 127.3 and 127.10. These apply to individuals, not just companies.</p>
+      <h4>Questions?</h4>
+      <p>Talk to Alex Hauptman or Peter Hauptman (the Empowered Official) any time.</p>
+      <p style="margin-top: 24px; color: var(--muted); font-size: 12px;">This briefing is part of Sunset's ITAR Compliance Policy v1.1 (May 2026), Sections 11, 12, and 13.</p>
+    </div>
+    <div class="modal-foot">
+      <button type="button" class="btn primary" id="close-briefing-btn">I've Read the Briefing</button>
+    </div>
+  </div>
+</div>
+<script>
+/* ============================================================
+   Sunset Industries — Visitor Kiosk
+   Single-file, kiosk-friendly, offline-resilient sign-in app.
+   ============================================================ */
+/* ===== Configuration ===== */
+const CONFIG = {
+  // Power Automate HTTP-trigger URL — replace after Power Automate flow is set up
+  WEBHOOK_URL: 'https://default09de53b1edac406d85ce3fa85ba614.53.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/6e0eb19736fb4051b7fcc1690f615af9/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=hFV6ch2TO0LcKscdCv75BF4Gt8iQG3nomgfYpnc0fsU',
+  AUTO_RESET_SECONDS: 10,
+  AUTO_INACTIVE_RESET_SECONDS: 180, // 3-min idle reset
 };
-
-let pool;
-function cfgWithEncrypt(enc) {
-  return Object.assign({}, sqlConfig, { options: Object.assign({}, sqlConfig.options, { encrypt: enc }) });
+const PURPOSE_CHIPS = [
+  "Vendor / Supplier Meeting",
+  "Service or Maintenance Call",
+  "Sales Call",
+  "Customer Audit",
+  "Job Interview",
+  "IT / Tech Support",
+  "Tooling Drop-off / Pickup",
+  "Roofing / Facility Work",
+];
+const COMPANY_CHIPS = [
+  "Sunset Self (Interview)",
+];
+const AREAS = [
+  "Shop Floor",
+  "Maintenance Areas",
+  "Office Space",
+  "Server Room",
+  "Inspection",
+  "Inventory",
+];
+/* ===== State ===== */
+const state = {
+  visitType: 'Escorted',
+  countdown: CONFIG.AUTO_RESET_SECONDS,
+  countdownTimer: null,
+  inactivityTimer: null,
+  pendingQueue: [], // submissions queued while offline
+};
+/* ===== Element refs ===== */
+const $ = id => document.getElementById(id);
+const screen = (name) => {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  $('screen-' + name).classList.add('active');
+  resetInactivityTimer();
+};
+/* ===== Live clock ===== */
+function tickClock() {
+  const now = new Date();
+  $('liveClock').textContent = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: true});
+  $('liveDate').textContent = now.toLocaleDateString([], {weekday: 'short', month: 'short', day: 'numeric'});
 }
-async function getPool() {
-  if (pool) return pool;
-  const primary = sqlConfig.options.encrypt;
-  try {
-    pool = await sql.connect(cfgWithEncrypt(primary));
-  } catch (e) {
-    console.error('SQL connect failed with encrypt=' + primary + ' (' + e.message + '); retrying with encrypt=' + (!primary) + '...');
-    pool = await sql.connect(cfgWithEncrypt(!primary));
-    console.log('SQL connected on retry with encrypt=' + (!primary));
-  }
-  try { pool.removeAllListeners('error'); pool.on('error', e => console.error('SQL pool error:', e.message)); } catch (_) {}
-  return pool;
+setInterval(tickClock, 1000); tickClock();
+/* ===== Date / time helpers ===== */
+function todayDateStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
-
-let wpool;
-async function getWritePool() {
-  if (wpool) return wpool;
-  if (!CFG.sqlWrite || !CFG.sqlWrite.user) throw new Error('sqlWrite not configured in config.json');
-  const base = Object.assign({}, sqlConfig, { user: CFG.sqlWrite.user, password: CFG.sqlWrite.password });
-  const mk = (enc) => Object.assign({}, base, { options: Object.assign({}, base.options, { encrypt: enc }) });
-  const primary = base.options.encrypt;
-  try { wpool = await new sql.ConnectionPool(mk(primary)).connect(); }
-  catch (e) {
-    console.error('Write pool failed with encrypt=' + primary + ' (' + e.message + '); retrying...');
-    wpool = await new sql.ConnectionPool(mk(!primary)).connect();
-  }
-  try { wpool.removeAllListeners('error'); wpool.on('error', e => console.error('Write pool error:', e.message)); } catch (_) {}
-  return wpool;
+function nowTimeStr() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
 }
-
-const roleCache = new Map();              // EmplCode -> { role, t }
-const partFilesCache = new Map();         // part -> { files, t }
-/* ---- In-memory operator sessions (code + PIN -> short-lived token) -------- */
-const sessions = new Map();                 // token -> { code, role, name, exp }
-const SESSION_MS = 12 * 3600 * 1000;        // 12h, cleared on server restart
-function newSession(code, role, name) {
-  const tok = crypto.randomBytes(24).toString('hex');
-  sessions.set(tok, { code: parseInt(code, 10), role, name, exp: Date.now() + SESSION_MS });
-  return tok;
+/* ===== Chip rendering ===== */
+function renderChips(containerId, options, customInputId) {
+  const container = $(containerId);
+  container.innerHTML = '';
+  const input = $(customInputId);
+  options.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'chip'; btn.textContent = opt;
+    btn.addEventListener('click', () => {
+      container.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      btn.classList.add('active');
+      input.value = opt;
+    });
+    container.appendChild(btn);
+  });
+  const customBtn = document.createElement('button');
+  customBtn.type = 'button'; customBtn.className = 'chip custom-trigger';
+  customBtn.textContent = '+ Type your own';
+  customBtn.addEventListener('click', () => {
+    container.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+    customBtn.classList.add('active');
+    input.value = '';
+    input.focus();
+  });
+  container.appendChild(customBtn);
 }
-function sessionOf(req) {
-  const tok = (req.headers['x-session'] || '').toString();
-  if (!tok) return null;
-  const sN = sessions.get(tok);
-  if (!sN) return null;
-  if (Date.now() > sN.exp) { sessions.delete(tok); return null; }
-  return Object.assign({ token: tok }, sN);
-}
-async function roleOf(code) {
-  code = parseInt(code, 10); if (!code) return 'Operator';
-  const c = roleCache.get(code); if (c && Date.now() - c.t < 60000) return c.role;
-  try {
-    const wp = await getWritePool();
-    const r = await wp.request().input('EmplCode', sql.SmallInt, code).execute('app.usp_OperatorRole_Get');
-    const role = (r.recordset && r.recordset[0] && r.recordset[0].Role) || 'Operator';
-    roleCache.set(code, { role, t: Date.now() });
-    return role;
-  } catch (e) { return 'Operator'; }   // default least-privilege if the table/proc isn't there yet
-}
-
-/* ---- Path resolution: legacy Airborne -> Parker FSD, + safety guard ------- */
-function rewriteAirborne(p) {
-  return p.replace(/S:\\Customers\\Airborne\\Airborne Prints\\/i,
-                   'S:\\Customers\\Parker FSD\\Airborne Prints\\');
-}
-function safeUnder(f) {
-  const norm = path.normalize(f).toLowerCase();
-  return ALLOWED_ROOTS.some(r => norm.startsWith(r));
-}
-function baseName(p) {                       // robust to \ and / separators
-  const i = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
-  return i >= 0 ? p.slice(i + 1) : p;
-}
-function resolveExisting(rawPath) {
-  let f = rawPath;
-  if (!fs.existsSync(f)) {
-    const alt = rewriteAirborne(f);
-    if (alt !== f && fs.existsSync(alt)) f = alt;
-  }
-  if (!safeUnder(f)) return null;
-  return fs.existsSync(f) ? f : null;
-}
-
-/* ---- Classify / order a part's drawing files ----------------------------- */
-const OP_RE = /\bOP\s*\.?\s*(\d+)/i;
-const OTHER_TOKENS = ['VQR','GAGE','LAYOUT','CASTING','MARKUP','SKETCH','NOTES','ECO','OFFLOAD','QUALIFYING','SLOT'];
-const isOp    = n => OP_RE.test(n);
-const isOther = n => !isOp(n) && OTHER_TOKENS.some(t => n.toUpperCase().includes(t));
-const isMain  = n => !isOp(n) && !isOther(n);
-const opNum   = n => { const m = OP_RE.exec(n); return m ? parseInt(m[1], 10) : 9999; };
-function revOf(n){ const m = /\bRev\.?\s*([A-Z0-9]{1,3})\b/i.exec(n); return m ? m[1].toUpperCase() : ''; }
-
-async function getPartFiles(part) {
-  const cached = partFilesCache.get(part);
-  if (cached && Date.now() - cached.t < 300000) return cached.files;   // 5-min cache
-  const p = await getPool();
-  const rs = await p.request()
-    .input('part', sql.NVarChar, part)
-    .query("SELECT pf.FileName FROM dbo.PartFiles pf " +
-           "WHERE pf.PartNo=@part AND pf.FileName LIKE '%:\\%' AND pf.FileName LIKE '%.pdf'");
-  const seen = new Set(); const found = [];
-  for (const row of rs.recordset) {
-    const raw = row.FileName;
-    const base = baseName(raw);
-    const key = base.toLowerCase();
-    if (seen.has(key)) continue;
-    const real = resolveExisting(raw);
-    if (real) { seen.add(key); found.push({ name: base, real }); }
-  }
-  const mains = found.filter(f => isMain(f.name));
-  const ops   = found.filter(f => isOp(f.name)).sort((a,b)=> opNum(a.name)-opNum(b.name) || a.name.localeCompare(b.name));
-  const lead  = mains.sort((a,b)=>a.name.length-b.name.length)[0] || ops[0] || found.sort((a,b)=>a.name.length-b.name.length)[0];
-  if (!lead) { partFilesCache.set(part, { files: [], t: Date.now() }); return []; }
-  const ordered = [lead, ...ops.filter(f => f !== lead)];
-  const rev = revOf(lead.name);
-  const out = ordered.map((f, i) => ({
-    sheet: i,
-    label: (f === lead && isMain(f.name)) ? ('Main' + (rev ? ' · Rev ' + rev : ''))
-          : isOp(f.name) ? ('OP ' + opNum(f.name))
-          : f.name.replace(/\.pdf$/i,'').slice(0,24),
-    name: f.name,
-    real: f.real
-  }));
-  partFilesCache.set(part, { files: out, t: Date.now() });
-  return out;
-}
-
-/* ---- HTTP helpers -------------------------------------------------------- */
-function sendJSON(res, code, obj) {
-  const b = Buffer.from(JSON.stringify(obj));
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': b.length });
-  res.end(b);
-}
-function sendJSONgz(req, res, code, obj) {
-  const raw = Buffer.from(JSON.stringify(obj));
-  const ae = (req.headers['accept-encoding'] || '');
-  if (/\bgzip\b/.test(ae) && raw.length > 1024) {
-    const gz = zlib.gzipSync(raw);
-    res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Vary': 'Accept-Encoding' });
-    return res.end(gz);
-  }
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': raw.length });
-  res.end(raw);
-}
-function readBody(req) {
-  return new Promise((resolve) => {
-    let d = ''; req.on('data', c => { d += c; if (d.length > 4000000) req.destroy(); });
-    req.on('end', () => resolve(d));
+/* ===== Areas checkboxes ===== */
+function renderAreas() {
+  const container = $('uns-areas');
+  container.innerHTML = '';
+  AREAS.forEach(a => {
+    const lbl = document.createElement('label');
+    lbl.className = 'check';
+    lbl.innerHTML = '<input type="checkbox" value="' + a + '"><span>' + a + '</span>';
+    const input = lbl.querySelector('input');
+    input.addEventListener('change', () => lbl.classList.toggle('checked', input.checked));
+    container.appendChild(lbl);
   });
 }
-const STATIC = { '.html':'text/html', '.js':'text/javascript', '.css':'text/css', '.png':'image/png', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
-
-/* ---- Request router ------------------------------------------------------ */
-const server = http.createServer(async (req, res) => {
-  const u = url.parse(req.url, true);
+/* ===== Form prefill ===== */
+function prefillEscortedForm() {
+  $('esc-name').value = '';
+  $('esc-company').value = '';
+  $('esc-purpose').value = '';
+  $('esc-date').value = todayDateStr();
+  $('esc-time-in').value = nowTimeStr();
+  $('esc-time-out').value = '';
+  $('esc-ack').checked = false;
+  $('esc-sig').value = '';
+  $('esc-escort-sig').value = '';
+  document.querySelectorAll('#esc-company-chips .chip, #esc-purpose-chips .chip').forEach(c => c.classList.remove('active'));
+}
+function prefillUnescortedForm() {
+  $('uns-briefing-ack').checked = false;
+  $('uns-name').value = '';
+  $('uns-company').value = '';
+  $('uns-uspers').checked = false;
+  $('uns-sig').value = '';
+  $('uns-mgmt-id').checked = false;
+  $('uns-purpose').value = '';
+  $('uns-mgmt-name').value = '';
+  $('uns-mgmt-sig').value = '';
+  $('uns-start-date').value = todayDateStr();
+  $('uns-start-time').value = nowTimeStr();
+  $('uns-end-date').value = todayDateStr();
+  // End time default = +4 hours
+  const d = new Date(); d.setHours(d.getHours() + 4);
+  $('uns-end-time').value = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  document.querySelectorAll('#uns-company-chips .chip, #uns-purpose-chips .chip').forEach(c => c.classList.remove('active'));
+  document.querySelectorAll('#uns-areas input').forEach(i => { i.checked = false; i.parentElement.classList.remove('checked'); });
+}
+/* ===== Validation ===== */
+function validateEscorted() {
+  const fields = [
+    ['esc-name', 'Visitor name'],
+    ['esc-company', 'Company'],
+    ['esc-purpose', 'Purpose of visit'],
+    ['esc-time-out', 'Estimated time out'],
+    ['esc-sig', 'Visitor signature'],
+    ['esc-escort-sig', 'Escort signature'],
+  ];
+  for (const [id, label] of fields) {
+    if (!$(id).value.trim()) { alert(label + ' is required.'); $(id).focus(); return false; }
+  }
+  if (!$('esc-ack').checked) { alert('Please acknowledge the photography and access restriction.'); return false; }
+  // Signature must match the name typed
+  if ($('esc-sig').value.trim().toLowerCase() !== $('esc-name').value.trim().toLowerCase()) {
+    if (!confirm('The signature does not match the visitor name. Submit anyway?')) return false;
+  }
+  return true;
+}
+function validateUnescorted() {
+  if (!$('uns-briefing-ack').checked) { alert('Please acknowledge the ITAR Briefing first.'); return false; }
+  const fields = [
+    ['uns-name', 'Visitor name'],
+    ['uns-company', 'Company'],
+    ['uns-sig', 'Visitor signature'],
+    ['uns-purpose', 'Purpose of visit'],
+    ['uns-mgmt-name', 'Manager name'],
+    ['uns-mgmt-sig', 'Manager signature'],
+    ['uns-start-date', 'Authorization start date'],
+    ['uns-start-time', 'Authorization start time'],
+    ['uns-end-date', 'Authorization end date'],
+    ['uns-end-time', 'Authorization end time'],
+  ];
+  for (const [id, label] of fields) {
+    if (!$(id).value.trim()) { alert(label + ' is required.'); $(id).focus(); return false; }
+  }
+  if (!$('uns-uspers').checked) { alert('Please confirm U.S. person status.'); return false; }
+  if (!$('uns-mgmt-id').checked) { alert('Manager must confirm visual ID verification.'); return false; }
+  const areasChecked = Array.from(document.querySelectorAll('#uns-areas input:checked'));
+  if (areasChecked.length === 0) { alert('Please check at least one area authorized.'); return false; }
+  return true;
+}
+/* ===== Build payload ===== */
+function buildEscortedPayload() {
+  return {
+    submittedAt: new Date().toISOString(),
+    visitType: 'Escorted',
+    visitorName: $('esc-name').value.trim(),
+    company: $('esc-company').value.trim(),
+    purpose: $('esc-purpose').value.trim(),
+    dateOfVisit: $('esc-date').value,
+    timeIn: $('esc-time-in').value,
+    timeOutEst: $('esc-time-out').value,
+    visitorAck: $('esc-ack').checked ? 'Acknowledged' : '',
+    visitorSig: $('esc-sig').value.trim(),
+    escortName: $('esc-escort-sig').value.trim(),
+    usPersonSelfDecl: '',
+    briefingAck: '',
+    mgmtVerifiedId: '',
+    areasAuthorized: '',
+    authStartDate: '',
+    authStartTime: '',
+    authEndDate: '',
+    authEndTime: '',
+    mgmtAuthName: '',
+    authDate: '',
+    mgmtAuthSig: '',
+    notes: '',
+    source: 'Kiosk v1',
+  };
+}
+function buildUnescortedPayload() {
+  const areas = Array.from(document.querySelectorAll('#uns-areas input:checked')).map(i => i.value).join(', ');
+  return {
+    submittedAt: new Date().toISOString(),
+    visitType: 'Unescorted',
+    visitorName: $('uns-name').value.trim(),
+    company: $('uns-company').value.trim(),
+    purpose: $('uns-purpose').value.trim(),
+    dateOfVisit: todayDateStr(),
+    timeIn: nowTimeStr(),
+    timeOutEst: $('uns-end-time').value,
+    visitorAck: $('uns-uspers').checked ? 'U.S. Person attested' : '',
+    visitorSig: $('uns-sig').value.trim(),
+    escortName: '',
+    usPersonSelfDecl: $('uns-uspers').checked ? 'I am a US person as defined by ITAR' : '',
+    briefingAck: $('uns-briefing-ack').checked ? 'Briefing acknowledged' : '',
+    mgmtVerifiedId: $('uns-mgmt-id').checked ? 'Visually verified gov ID + US person proof' : '',
+    areasAuthorized: areas,
+    authStartDate: $('uns-start-date').value,
+    authStartTime: $('uns-start-time').value,
+    authEndDate: $('uns-end-date').value,
+    authEndTime: $('uns-end-time').value,
+    mgmtAuthName: $('uns-mgmt-name').value.trim(),
+    authDate: todayDateStr(),
+    mgmtAuthSig: $('uns-mgmt-sig').value.trim(),
+    notes: '',
+    source: 'Kiosk v1',
+  };
+}
+/* ===== Submission ===== */
+async function submitPayload(payload) {
+  // If webhook is not configured, just queue locally
+  if (CONFIG.WEBHOOK_URL.includes('PASTE_WEBHOOK_URL_HERE')) {
+    queueOffline(payload);
+    return { ok: true, queued: true };
+  }
   try {
-    if (u.pathname === '/api/query' && req.method === 'POST') {
-      const q = (await readBody(req)).trim();
-      if (!/^select\b/i.test(q) || q.includes(';')) return sendJSON(res, 400, { error: 'Only a single SELECT is allowed.' });
-      const p = await getPool();
-      const result = await p.request().query(q);
-      const rec = result.recordset || [];
-      const colMeta = rec.columns || {};
-      const cols = Object.keys(colMeta).sort((a,b)=> (colMeta[a].index||0) - (colMeta[b].index||0));
-      const rows = rec.map(r => cols.map(c => r[c]));
-      return sendJSONgz(req, res, 200, { columns: cols.length ? cols : Object.keys(rec[0]||{}), rows });
-    }
-
-    if (u.pathname === '/api/part-files') {
-      const part = (u.query.part || '').trim();
-      if (!part) return sendJSON(res, 400, { error: 'part required' });
-      const files = await getPartFiles(part);
-      return sendJSONgz(req, res, 200, files.map(f => ({ sheet: f.sheet, label: f.label, name: f.name })));
-    }
-
-    if (u.pathname === '/file') {
-      const part = (u.query.part || '').trim();
-      const i = parseInt(u.query.i || '0', 10) || 0;
-      if (!part) { res.writeHead(400); return res.end('part required'); }
-      const files = await getPartFiles(part);
-      const f = files[i];
-      if (!f) { res.writeHead(404); return res.end('not found'); }
-      const stat = fs.statSync(f.real);
-      res.writeHead(200, {
-        'Content-Type': 'application/pdf',
-        'Content-Length': stat.size,
-        'Content-Disposition': 'inline; filename="' + f.name.replace(/[^\x20-\x7e]/g,'_') + '"',
-        'Cache-Control': 'private, max-age=300'
+    const res = await fetch(CONFIG.WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return { ok: true };
+  } catch (e) {
+    console.error('Submit failed:', e);
+    queueOffline(payload);
+    return { ok: false, queued: true, error: e.message };
+  }
+}
+function queueOffline(payload) {
+  const q = JSON.parse(localStorage.getItem('si_queue') || '[]');
+  q.push(payload);
+  localStorage.setItem('si_queue', JSON.stringify(q));
+  updateStatusBadge();
+}
+async function retryQueue() {
+  if (CONFIG.WEBHOOK_URL.includes('PASTE_WEBHOOK_URL_HERE')) return;
+  const q = JSON.parse(localStorage.getItem('si_queue') || '[]');
+  if (q.length === 0) return;
+  const remaining = [];
+  for (const p of q) {
+    try {
+      const res = await fetch(CONFIG.WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(p),
       });
-      fs.createReadStream(f.real).pipe(res);
-      return;
-    }
-
-    if (u.pathname === '/api/board-state' && req.method === 'GET') {
-      const wp = await getWritePool();
-      const r = await wp.request().input('BoardKey', sql.NVarChar, 'main').execute('app.usp_BoardState_Get');
-      const row = (r.recordset && r.recordset[0]) || null;
-      const utc = (row && row.UpdatedUTC) ? new Date(row.UpdatedUTC).toISOString() : '';
-      const since = (u.query.since || '').toString();
-      if (since && since === utc) return sendJSONgz(req, res, 200, { unchanged: true, updatedUTC: utc });
-      return sendJSONgz(req, res, 200, { state: row ? row.StateJson : null, updatedUTC: utc || null, updatedBy: row ? row.UpdatedBy : null });
-    }
-    if (u.pathname === '/api/board-state' && req.method === 'POST') {
-      const body = await readBody(req);
-      const by = (req.headers['x-operator'] || '').toString().slice(0, 60) || null;
-      const wp = await getWritePool();
-      await wp.request()
-        .input('BoardKey', sql.NVarChar, 'main')
-        .input('StateJson', sql.NVarChar(sql.MAX), body)
-        .input('UpdatedBy', sql.NVarChar, by)
-        .execute('app.usp_BoardState_Set');
-      return sendJSON(res, 200, { ok: true });
-    }
-    if (u.pathname === '/api/operators') {
-      const p = await getPool();
-      const r = await p.request().query("SELECT EmplCode, EmplName, EmplShortName FROM dbo.EmplCode WHERE ISNULL(Active,'Y')<>'N' AND TermDate IS NULL ORDER BY EmplName");
-      const rec = r.recordset || [];
-      return sendJSON(res, 200, rec.map(x => ({ code: x.EmplCode, name: x.EmplName, short: x.EmplShortName })));
-    }
-
-    if (u.pathname === '/api/login' && req.method === 'POST') {
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      const code = parseInt(b.code, 10);
-      if (!code || !b.pin) return sendJSON(res, 400, { error: 'code and pin required' });
-      const wp = await getWritePool();
-      const r = await wp.request()
-        .input('EmplCode', sql.SmallInt, code)
-        .input('Pin', sql.NVarChar, String(b.pin).slice(0, 20))
-        .execute('app.usp_Operator_CheckPin');
-      const row = (r.recordset && r.recordset[0]) || {};
-      if (row.NeedEnroll) return sendJSON(res, 200, { needEnroll: true });
-      if (row.Locked)     return sendJSON(res, 423, { error: 'Too many wrong PINs - locked for 5 minutes.' });
-      if (!row.Ok)        return sendJSON(res, 401, { error: 'Wrong employee code or PIN.' });
-      const role = await roleOf(code);
-      const token = newSession(code, role, row.EmplName || '');
-      return sendJSON(res, 200, { ok: true, token, code, name: row.EmplName || '', role });
-    }
-    if (u.pathname === '/api/enroll' && req.method === 'POST') {
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      const code = parseInt(b.code, 10);
-      if (!code || !b.pin || String(b.pin).length < 4) return sendJSON(res, 400, { error: 'code and 4+ digit pin required' });
-      const wp = await getWritePool();
-      const vp = await wp.request().input('EmplCode', sql.SmallInt, code).execute('app.usp_Operator_Validate');
-      if (!vp.recordset || !vp.recordset.length) return sendJSON(res, 403, { error: 'Not a valid active employee.' });
-      try {
-        await wp.request()
-          .input('EmplCode', sql.SmallInt, code)
-          .input('Pin', sql.NVarChar, String(b.pin).slice(0, 20))
-          .input('By', sql.NVarChar, 'self-enroll')
-          .execute('app.usp_Operator_SetPin');     // @AllowOverwrite defaults 0 -> errors if a PIN already exists
-      } catch (e) {
-        return sendJSON(res, 409, { error: 'A PIN is already set for this code - sign in instead.' });
-      }
-      const name = (vp.recordset[0] && vp.recordset[0].EmplName) || '';
-      const role = await roleOf(code);
-      const token = newSession(code, role, name);
-      return sendJSON(res, 200, { ok: true, token, code, name, role });
-    }
-    if (u.pathname === '/api/whoami' && req.method === 'GET') {
-      const sN = sessionOf(req);
-      if (!sN) return sendJSON(res, 401, { error: 'no session' });
-      return sendJSON(res, 200, { ok: true, code: sN.code, name: sN.name, role: sN.role });
-    }
-    if (u.pathname === '/api/logout' && req.method === 'POST') {
-      const tok = (req.headers['x-session'] || '').toString();
-      if (tok) sessions.delete(tok);
-      return sendJSON(res, 200, { ok: true });
-    }
-    if (u.pathname === '/api/pin-reset' && req.method === 'POST') {
-      const admin = sessionOf(req);
-      if (!admin || admin.role !== 'Admin') return sendJSON(res, 403, { error: 'admin only' });
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      const code = parseInt(b.code, 10);
-      if (!code) return sendJSON(res, 400, { error: 'code required' });
-      const wp = await getWritePool();
-      await wp.request().input('EmplCode', sql.SmallInt, code).input('By', sql.NVarChar, String(admin.code)).execute('app.usp_Operator_ClearPin');
-      for (const [t, sN] of sessions) { if (sN.code === code) sessions.delete(t); }   // drop their live sessions
-      return sendJSON(res, 200, { ok: true });
-    }
-
-    if (u.pathname === '/api/punch' && req.method === 'POST') {
-      const sess = sessionOf(req);
-      if (!sess) return sendJSON(res, 401, { error: 'Sign in (code + PIN) before logging time.' });   // identity comes from the session, never the body
-      let b = {};
-      try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      if (!b.jobNo || b.stepNo == null) return sendJSON(res, 400, { error: 'jobNo, stepNo required' });
-      if (sess.role === 'Manager') return sendJSON(res, 403, { error: 'Managers cannot record time punches.' });
-      const wp = await getWritePool();
-      // session already proves a valid code+PIN; keep the active-employee check as defense in depth
-      const vp = await wp.request().input('EmplCode', sql.SmallInt, sess.code).execute('app.usp_Operator_Validate');
-      if (!vp.recordset || !vp.recordset.length) return sendJSON(res, 403, { error: 'Not a valid signed-in operator.' });
-      const r = await wp.request()
-        .input('EmplCode',       sql.SmallInt, sess.code)
-        .input('JobNo',          sql.NVarChar, String(b.jobNo).slice(0, 16))
-        .input('StepNo',         sql.SmallInt, parseInt(b.stepNo, 10))
-        .input('TimeStart',      sql.NChar,    (b.timeStart || '').toString().slice(0, 5))
-        .input('TimeEnd',        sql.NChar,    (b.timeEnd || '').toString().slice(0, 5))
-        .input('CycleHours',     sql.Float,    +b.cycleHours || 0)
-        .input('PiecesFinished', sql.Float,    +b.pieces || 0)
-        .input('PiecesScrapped', sql.Float,    +b.scrap || 0)
-        .input('IsSetup',        sql.Bit,      b.setup ? 1 : 0)
-        .input('SourceIP',       sql.NVarChar, (req.socket && req.socket.remoteAddress || '').slice(0, 45))
-        .execute('app.usp_TimeTicket_Add');
-      const row = (r.recordset && r.recordset[0]) || {};
-      return sendJSON(res, 200, { ok: true, ticketId: row.TimeTicketDet_ID || null, workCntr: row.WorkCntr || null, workCntrName: row.WorkCntrName || null });
-    }
-
-    if (u.pathname === '/api/ticket-edit' && req.method === 'POST') {
-      const admin = sessionOf(req);
-      if (!admin || admin.role !== 'Admin') return sendJSON(res, 403, { error: 'Admin sign-in required to edit time tickets.' });
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      const id = parseInt(b.id, 10);
-      if (!id) return sendJSON(res, 400, { error: 'time-ticket id required' });
-      const numN = v => (v === undefined || v === null || v === '') ? null : (+v);
-      const wp = await getWritePool();
-      const r = await wp.request()
-        .input('TimeTicketDet_ID', sql.Int,      id)
-        .input('SetupTime',        sql.Float,    numN(b.setup))
-        .input('CycleTime',        sql.Float,    numN(b.cycle))
-        .input('PiecesFinished',   sql.Float,    numN(b.finished))
-        .input('PiecesScrapped',   sql.Float,    numN(b.scrapped))
-        .input('EmplCode',         sql.SmallInt, admin.code)
-        .input('SourceIP',         sql.NVarChar, (req.socket && req.socket.remoteAddress || '').slice(0, 45))
-        .execute('app.usp_TimeTicketDet_Edit');
-      return sendJSON(res, 200, { ok: true, row: (r.recordset && r.recordset[0]) || {} });
-    }
-    if (u.pathname === '/api/routing-note' && req.method === 'POST') {
-      const admin = sessionOf(req);
-      if (!admin || admin.role !== 'Admin') return sendJSON(res, 403, { error: 'Admin sign-in required to edit routing notes.' });
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      if (!b.part || b.step == null || !String(b.note || '').trim()) return sendJSON(res, 400, { error: 'part, step, note required' });
-      const wp = await getWritePool();
-      const r = await wp.request()
-        .input('PartNo',   sql.NVarChar, String(b.part).slice(0, 50))
-        .input('StepNo',   sql.SmallInt, parseInt(b.step, 10))
-        .input('Note',     sql.NVarChar(sql.MAX), String(b.note).slice(0, 4000))
-        .input('Mode',     sql.NVarChar, (b.mode === 'replace' ? 'replace' : 'append'))
-        .input('EmplCode', sql.SmallInt, admin.code)
-        .input('SourceIP', sql.NVarChar, (req.socket && req.socket.remoteAddress || '').slice(0, 45))
-        .execute('app.usp_RoutingNote_Add');
-      return sendJSON(res, 200, { ok: true, row: (r.recordset && r.recordset[0]) || {} });
-    }
-
-    if (u.pathname === '/api/job-hours' && req.method === 'POST') {
-      const admin = sessionOf(req);
-      if (!admin || admin.role !== 'Admin') return sendJSON(res, 403, { error: 'Admin sign-in required to adjust job hours.' });
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      if (!b.jobNo || b.hours == null) return sendJSON(res, 400, { error: 'jobNo, hours required' });
-      const wp = await getWritePool();
-      const r = await wp.request()
-        .input('JobNo',       sql.NVarChar, String(b.jobNo).slice(0, 16))
-        .input('TargetHours', sql.Float,    +b.hours)
-        .input('EmplCode',    sql.SmallInt, admin.code)
-        .input('SourceIP',    sql.NVarChar, (req.socket && req.socket.remoteAddress || '').slice(0, 45))
-        .execute('app.usp_Job_AdjustHours');
-      return sendJSON(res, 200, { ok: true, row: (r.recordset && r.recordset[0]) || {} });
-    }
-
-    if (u.pathname === '/api/messages' && req.method === 'GET') {
-      const since = parseInt(u.query.since || '0', 10) || 0;
-      const wp = await getWritePool();
-      const r = await wp.request().input('SinceID', sql.BigInt, since).execute('app.usp_Messages_Get');
-      const rec = r.recordset || [];
-      return sendJSONgz(req, res, 200, rec.map(m => ({ id: Number(m.MsgID), whenUTC: m.WhenUTC, code: m.EmplCode, from: m.FromName, role: m.Role, job: m.JobRef, body: m.Body })));
-    }
-    if (u.pathname === '/api/messages' && req.method === 'POST') {
-      let b = {};
-      try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      if (!b.body || !b.from) return sendJSON(res, 400, { error: 'from and body required' });
-      const wp = await getWritePool();
-      const r = await wp.request()
-        .input('FromName', sql.NVarChar, String(b.from).slice(0, 80))
-        .input('Body',     sql.NVarChar, String(b.body).slice(0, 2000))
-        .input('Role',     sql.NVarChar, b.role ? String(b.role).slice(0, 20) : null)
-        .input('JobRef',   sql.NVarChar, b.job ? String(b.job).slice(0, 80) : null)
-        .input('EmplCode', sql.SmallInt, (b.code != null && !isNaN(parseInt(b.code, 10))) ? parseInt(b.code, 10) : null)
-        .execute('app.usp_Messages_Add');
-      const row = (r.recordset && r.recordset[0]) || {};
-      return sendJSON(res, 200, { ok: true, id: row.MsgID ? Number(row.MsgID) : null });
-    }
-
-    if (u.pathname === '/api/role' && req.method === 'GET') {
-      return sendJSON(res, 200, { code: parseInt(u.query.code || '0', 10) || 0, role: await roleOf(u.query.code) });
-    }
-    if (u.pathname === '/api/roles' && req.method === 'GET') {
-      { const a = sessionOf(req); if (!a || a.role !== 'Admin') return sendJSON(res, 403, { error: 'admin only' }); }
-      const wp = await getWritePool();
-      const r = await wp.request().execute('app.usp_OperatorRoles_List');
-      return sendJSON(res, 200, (r.recordset || []).map(x => ({ code: x.EmplCode, name: x.EmplName, role: x.Role })));
-    }
-    if (u.pathname === '/api/role' && req.method === 'POST') {
-      { const a = sessionOf(req); if (!a || a.role !== 'Admin') return sendJSON(res, 403, { error: 'admin only' }); }
-      let b = {}; try { b = JSON.parse(await readBody(req)); } catch (e) { return sendJSON(res, 400, { error: 'bad json' }); }
-      if (!b.code || !b.role) return sendJSON(res, 400, { error: 'code and role required' });
-      const wp = await getWritePool();
-      await wp.request()
-        .input('EmplCode', sql.SmallInt, parseInt(b.code, 10))
-        .input('Role', sql.NVarChar, String(b.role))
-        .input('By', sql.NVarChar, String((sessionOf(req) || {}).code || ''))
-        .execute('app.usp_OperatorRole_Set');
-      roleCache.delete(parseInt(b.code, 10));
-      return sendJSON(res, 200, { ok: true });
-    }
-
-    // static: ONLY the board + vendor assets (never config.json / server.js)
-    const rel = u.pathname === '/' ? '/board.html' : u.pathname;
-    if (rel === '/board.html' || rel === '/estimator.html' || rel === '/live-ops.html' || rel === '/assembly-cost.html' || rel === '/assembly-rollup.js' || rel === '/job-cost.html' || rel === '/data-qa.html' || rel === '/routing-study.html' || rel.startsWith('/vendor/')) {
-      const file = path.normalize(path.join(DIR, rel));
-      if (file.startsWith(DIR) && fs.existsSync(file) && fs.statSync(file).isFile()) {
-        const type = STATIC[path.extname(file).toLowerCase()] || 'application/octet-stream';
-        const ae = (req.headers['accept-encoding'] || '');
-        if (/\bgzip\b/.test(ae) && /\.(html|js|css|svg)$/i.test(file)) {
-          const gz = zlib.gzipSync(fs.readFileSync(file));
-          res.writeHead(200, { 'Content-Type': type, 'Content-Encoding': 'gzip', 'Content-Length': gz.length, 'Vary': 'Accept-Encoding' });
-          return res.end(gz);
-        }
-        res.writeHead(200, { 'Content-Type': type });
-        return fs.createReadStream(file).pipe(res);
-      }
-    }
-    res.writeHead(404); res.end('Not found');
-  } catch (e) {
-    console.error('ERR', u.pathname, e.message);
-    if (!res.headersSent) sendJSON(res, 500, { error: String(e.message || e) });
-    else res.end();
+      if (!res.ok) remaining.push(p);
+    } catch (e) { remaining.push(p); }
   }
-});
-
-module.exports = { server, getPartFiles, resolveExisting, rewriteAirborne, baseName };
-
-if (require.main === module) {
-  getPool()
-    .then(() => console.log('SQL connected: ' + sqlConfig.server + '/' + sqlConfig.database))
-    .catch(e => console.error('SQL connection FAILED (server still starting): ' + e.message));
-
-  server.listen(PORT, HOST, () => {
-    console.log('Sunset scheduling board running at  http://' + (HOST === '0.0.0.0' ? '<this-machine-ip>' : HOST) + ':' + PORT);
-    console.log('Print roots: ' + ALLOWED_ROOTS.join(', '));
-  });
+  localStorage.setItem('si_queue', JSON.stringify(remaining));
+  updateStatusBadge();
 }
+function updateStatusBadge() {
+  const q = JSON.parse(localStorage.getItem('si_queue') || '[]');
+  const online = navigator.onLine;
+  const dot = $('status-dot'); const txt = $('status-text'); const qc = $('queued-count');
+  dot.classList.toggle('offline', !online);
+  dot.classList.toggle('queued', online && q.length > 0);
+  txt.textContent = online ? 'Online' : 'Offline (will retry)';
+  qc.textContent = q.length > 0 ? '  ·  ' + q.length + ' queued' : '';
+}
+window.addEventListener('online', () => { updateStatusBadge(); retryQueue(); });
+window.addEventListener('offline', updateStatusBadge);
+/* ===== Success / reset ===== */
+function showSuccess(visitorName) {
+  // Personalize greeting
+  const firstName = (visitorName || '').split(' ')[0] || 'visitor';
+  $('success-greeting').textContent = 'Welcome, ' + firstName + '!';
+  screen('success');
+  state.countdown = CONFIG.AUTO_RESET_SECONDS;
+  $('countdown').textContent = state.countdown;
+  clearInterval(state.countdownTimer);
+  state.countdownTimer = setInterval(() => {
+    state.countdown--;
+    $('countdown').textContent = state.countdown;
+    if (state.countdown <= 0) {
+      clearInterval(state.countdownTimer);
+      resetKiosk();
+    }
+  }, 1000);
+}
+function resetKiosk() {
+  clearInterval(state.countdownTimer);
+  prefillEscortedForm();
+  prefillUnescortedForm();
+  // Reselect default
+  $('tile-escorted').classList.add('selected');
+  $('tile-unescorted').classList.remove('selected');
+  state.visitType = 'Escorted';
+  screen('welcome');
+}
+function resetInactivityTimer() {
+  clearTimeout(state.inactivityTimer);
+  // Only set inactivity reset if not on success screen
+  if (!$('screen-success').classList.contains('active') && !$('screen-welcome').classList.contains('active')) {
+    state.inactivityTimer = setTimeout(resetKiosk, CONFIG.AUTO_INACTIVE_RESET_SECONDS * 1000);
+  }
+}
+document.addEventListener('input', resetInactivityTimer);
+document.addEventListener('touchstart', resetInactivityTimer);
+document.addEventListener('mousedown', resetInactivityTimer);
+/* ===== Event wiring ===== */
+document.addEventListener('DOMContentLoaded', () => {
+  // Tiles
+  $('tile-escorted').addEventListener('click', () => {
+    state.visitType = 'Escorted';
+    $('tile-escorted').classList.add('selected');
+    $('tile-unescorted').classList.remove('selected');
+  });
+  $('tile-unescorted').addEventListener('click', () => {
+    state.visitType = 'Unescorted';
+    $('tile-unescorted').classList.add('selected');
+    $('tile-escorted').classList.remove('selected');
+  });
+  $('btn-start').addEventListener('click', () => {
+    if (state.visitType === 'Escorted') {
+      prefillEscortedForm();
+      screen('escorted');
+    } else {
+      prefillUnescortedForm();
+      screen('unescorted');
+    }
+  });
+  $('esc-back').addEventListener('click', () => screen('welcome'));
+  $('uns-back').addEventListener('click', () => screen('welcome'));
+  // Briefing modal
+  $('open-briefing').addEventListener('click', () => $('briefing-modal').classList.add('show'));
+  $('close-briefing').addEventListener('click', () => $('briefing-modal').classList.remove('show'));
+  $('close-briefing-btn').addEventListener('click', () => $('briefing-modal').classList.remove('show'));
+  // Chips
+  renderChips('esc-company-chips', COMPANY_CHIPS, 'esc-company');
+  renderChips('esc-purpose-chips', PURPOSE_CHIPS, 'esc-purpose');
+  renderChips('uns-company-chips', COMPANY_CHIPS, 'uns-company');
+  renderChips('uns-purpose-chips', PURPOSE_CHIPS, 'uns-purpose');
+  renderAreas();
+  // Submit handlers
+  $('esc-submit').addEventListener('click', async () => {
+    if (!validateEscorted()) return;
+    $('esc-submit').disabled = true;
+    const payload = buildEscortedPayload();
+    const result = await submitPayload(payload);
+    $('esc-submit').disabled = false;
+    if (result.queued) { $('success-sub').textContent = 'Your sign-in was queued (offline) and will sync when network returns.'; }
+    else { $('success-sub').textContent = 'Your sign-in has been recorded. A copy was sent to management.'; }
+    showSuccess(payload.visitorName);
+  });
+  $('uns-submit').addEventListener('click', async () => {
+    if (!validateUnescorted()) return;
+    $('uns-submit').disabled = true;
+    const payload = buildUnescortedPayload();
+    const result = await submitPayload(payload);
+    $('uns-submit').disabled = false;
+    if (result.queued) { $('success-sub').textContent = 'Sign-in queued (offline) and will sync when network returns.'; }
+    else { $('success-sub').textContent = 'Sign-in & authorization recorded. Copy sent to management.'; }
+    showSuccess(payload.visitorName);
+  });
+  // Reset now from success
+  $('reset-now').addEventListener('click', resetKiosk);
+  // Auto-check ack on input
+  $('esc-name').addEventListener('input', (e) => { if (!$('esc-sig').value) $('esc-sig').value = e.target.value; });
+  $('uns-name').addEventListener('input', (e) => { if (!$('uns-sig').value) $('uns-sig').value = e.target.value; });
+  // Toggle check class on Areas
+  // (handled in renderAreas)
+  // Initial status
+  updateStatusBadge();
+  // Retry queue on load
+  retryQueue();
+  // Retry every 60s
+  setInterval(retryQueue, 60000);
+});
+</script>
+</body>
+</html>
