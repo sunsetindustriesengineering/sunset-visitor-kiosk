@@ -139,12 +139,13 @@ h2 { font-size: 22px; font-weight: 600; margin: 0 0 12px; color: var(--dark); }
 }
 .field-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 .field-hint.warn { color: var(--warn); font-weight: 500; }
-input[type=text], input[type=date], input[type=time], textarea {
+input[type=text], input[type=date], input[type=time], select, textarea {
   width: 100%; padding: 14px 16px; font-size: 16px;
   border: 1.5px solid var(--border); border-radius: 8px;
   background: var(--white); color: var(--text); transition: border-color 0.15s;
 }
-input:focus, textarea:focus { outline: none; border-color: var(--orange); }
+select { cursor: pointer; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--orange); }
 input[readonly] { background: var(--gray); color: var(--muted); cursor: default; }
 textarea { min-height: 70px; resize: vertical; }
 /* ===== Chip selectors ===== */
@@ -360,7 +361,9 @@ footer .status-dot.queued { background: var(--info); }
           </div>
           <div class="field">
             <label>Estimated Time Out <span class="estimated-flag">ESTIMATED</span></label>
-            <input type="time" id="esc-time-out">
+            <select id="esc-time-out">
+              <option value="" disabled selected>Select a time…</option>
+            </select>
             <div class="field-hint warn">Best guess. If your visit runs longer, that's fine.</div>
           </div>
           <div class="ack">
@@ -651,6 +654,25 @@ function renderChips(containerId, options, customInputId) {
   });
   container.appendChild(customBtn);
 }
+/* ===== Estimated Time Out dropdown =====
+   15-minute options from 6:00 AM to 5:00 PM. The option VALUE stays in
+   24-hour "HH:MM" format (matches the old time picker + Power Automate),
+   while the visible text is friendly 12-hour "h:mm AM/PM". */
+function populateTimeOutOptions() {
+  const sel = $('esc-time-out');
+  if (!sel) return;
+  sel.innerHTML = '<option value="" disabled selected>Select a time…</option>';
+  for (let mins = 6 * 60; mins <= 17 * 60; mins += 15) {
+    const h = Math.floor(mins / 60), m = mins % 60;
+    const val = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    let h12 = h % 12; if (h12 === 0) h12 = 12;
+    const label = h12 + ':' + String(m).padStart(2, '0') + ' ' + ampm;
+    const opt = document.createElement('option');
+    opt.value = val; opt.textContent = label;
+    sel.appendChild(opt);
+  }
+}
 /* ===== Areas checkboxes ===== */
 function renderAreas() {
   const container = $('uns-areas');
@@ -925,6 +947,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderChips('uns-company-chips', COMPANY_CHIPS, 'uns-company');
   renderChips('uns-purpose-chips', PURPOSE_CHIPS, 'uns-purpose');
   renderAreas();
+  populateTimeOutOptions();
   // Submit handlers
   $('esc-submit').addEventListener('click', async () => {
     if (!validateEscorted()) return;
